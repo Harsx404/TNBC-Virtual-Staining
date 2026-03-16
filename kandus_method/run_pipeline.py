@@ -172,7 +172,6 @@ def run_single_core(
     if debug_dir is not None:
         try:
             from kandus_method.visualization_debug import save_debug_overlays
-            # Inject scores into stain_result for overlay labels
             stain_result["CPS"]          = scores["CPS"]
             stain_result["CPS_plus_plus"] = scores["CPS_plus_plus"]
             save_debug_overlays(
@@ -184,6 +183,34 @@ def run_single_core(
             )
         except Exception as e:
             print(f"        [warn] Debug overlays failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Step 6: Save per-cell coordinate CSV
+    # ------------------------------------------------------------------
+    tc_coords = compartments.get("tc_coords", [])
+    lc_coords = compartments.get("lc_coords", [])
+    st_coords = compartments.get("st_coords", [])
+
+    coords_dir = Path("results") / "coords"
+    coords_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = coords_dir / f"{core_id}_cells.csv"
+
+    import csv as _csv
+    with open(csv_path, "w", newline="") as f:
+        writer = _csv.DictWriter(f, fieldnames=["x", "y", "area_px", "cell_type"])
+        writer.writeheader()
+        for c in tc_coords:
+            writer.writerow({"x": c["x"], "y": c["y"],
+                             "area_px": c.get("area_px", ""), "cell_type": "TC"})
+        for c in lc_coords:
+            writer.writerow({"x": c["x"], "y": c["y"],
+                             "area_px": c.get("area_px", ""), "cell_type": "LC"})
+        for c in st_coords:
+            writer.writerow({"x": c["x"], "y": c["y"],
+                             "area_px": "", "cell_type": "ST"})
+
+    print(f"        Coords saved → {csv_path}  "
+          f"(TC={len(tc_coords)}, LC={len(lc_coords)}, ST={len(st_coords)})")
 
     output = {
         "core_id":    core_id,

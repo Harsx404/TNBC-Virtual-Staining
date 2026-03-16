@@ -209,6 +209,21 @@ def segment_tissue(
     tc_count = len([lbl for lbl, a in areas if a > tc_min])
     lc_count = len([lbl for lbl, a in areas if a <= lc_threshold])
 
+    # ---------------------------------------------------------------
+    # Step 7: Extract centroid coordinates (at original resolution)
+    # ---------------------------------------------------------------
+    scale_back = 1.0 / scale if scale < 1.0 else 1.0
+
+    tc_coords = _extract_nuclei_coords(
+        nuclei_labels, areas, lc_threshold, tc_min,
+        cell_type="TC", scale=scale_back,
+    )
+    lc_coords = _extract_nuclei_coords(
+        nuclei_labels, areas, lc_threshold, tc_min,
+        cell_type="LC", scale=scale_back,
+    )
+    st_coords = _sample_stroma_coords(st_mask_s, scale=scale_back, step=20)
+
     return {
         "tc_mask":      tc_mask_orig,
         "lc_mask":      lc_mask_orig,
@@ -219,6 +234,11 @@ def segment_tissue(
         "tc_count":     tc_count,
         "lc_count":     lc_count,
         "all_areas":    area_vals,
+        # Per-cell coordinates at ORIGINAL image resolution
+        # Each list item: {"x": int, "y": int, "area_px": int, "cell_type": str}
+        "tc_coords":    tc_coords,
+        "lc_coords":    lc_coords,
+        "st_coords":    st_coords,
     }
 
 
@@ -226,7 +246,6 @@ def _no_nuclei_result(tissue_mask: np.ndarray, orig_h: int = 0, orig_w: int = 0)
     """Return all-stroma result when no nuclei are detected."""
     h = orig_h or tissue_mask.shape[0]
     w = orig_w or tissue_mask.shape[1]
-    # Upsample tissue_mask to orig size if needed
     if tissue_mask.shape[0] != h or tissue_mask.shape[1] != w:
         tm = cv2.resize(tissue_mask.astype(np.uint8), (w, h),
                         interpolation=cv2.INTER_NEAREST).astype(bool)
@@ -243,4 +262,144 @@ def _no_nuclei_result(tissue_mask: np.ndarray, orig_h: int = 0, orig_w: int = 0)
         "tc_count":    0,
         "lc_count":    0,
         "all_areas":   np.array([]),
+        "tc_coords":   [],
+        "lc_coords":   [],
+        "st_coords":   _sample_stroma_coords(tm, scale=1.0, step=20),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Coordinate extraction helpers
+# ---------------------------------------------------------------------------
+
+def _extract_nuclei_coords(
+    nuclei_labels: np.ndarray,
+    areas: list[tuple[int, int]],
+    lc_threshold: float,
+    tc_min: float,
+    cell_type: str,  # "TC" or "LC"
+    scale: float = 1.0,
+) -> list[dict]:
+    """
+    Extract centroid coordinates from watershed nucleus labels.
+
+    Parameters
+    ----------
+    nuclei_labels : [H, W] int array (watershed output at SMALL resolution)
+    areas         : list of (label, area) pairs
+    lc_threshold  : size cutoff below which nuclei are LC
+    tc_min        : minimum size to be TC
+    cell_type     : 'TC' or 'LC'
+    scale         : multiply coords by this to get ORIGINAL resolution coords
+
+    Returns
+    -------
+    list of dicts: [{x, y, area_px, cell_type}, ...]
+    """
+    try:
+        from skimage.measure import regionprops
+    except ImportError:
+        # Fallback: use connected components centroids via cv2
+        coords = []
+        for lbl, area in areas:
+            if cell_type == "LC" and area > lc_threshold:
+                continue
+            if cell_type == "TC" and area <= tc_min:
+                continue
+            mask = (nuclei_labels == lbl).astype(np.uint8)
+            M = cv2.moments(mask)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"] * scale)
+                cy = int(M["m01"] / M["m00"] * scale)
+                coords.append({"x": cx, "y": cy,
+                               "area_px": int(area * scale * scale),
+                               "cell_type": cell_type})
+        return coords
+
+    # Build a label image containing only the requested cell type
+    filtered = np.zeros_like(nuclei_labels, dtype=np.int32)
+    valid_labels = set()
+    for lbl, area in areas:
+        if cell_type == "LC" and area <= lc_threshold:
+            filtered[nuclei_labels == lbl] = lbl
+            valid_labels.add(lbl)
+        elif cell_type == "TC" and area > tc_min:
+            filtered[nuclei_labels == lbl] = lbl
+            valid_labels.add(lbl)
+
+    if filtered.max() == 0:
+        return []
+
+    props = regionprops(filtered)
+    coords = []
+    for prop in props:
+        if prop.label not in valid_labels:
+            continue
+        # regionprops centroid: (row, col) = (y, x)
+        cy, cx = prop.centroid
+        cx_orig = int(cx * scale)
+        cy_orig = int(cy * scale)
+        area_orig = int(prop.area * scale * scale)
+        coords.append({
+            "x":         cx_orig,
+            "y":         cy_orig,
+            "area_px":   area_orig,
+            "cell_type": cell_type,
+        })
+    return coords
+
+
+def _sample_stroma_coords(
+    st_mask: np.ndarray,
+    scale: float = 1.0,
+    step: int = 20,
+) -> list[dict]:
+    """
+    Sample representative stroma positions from the stroma mask.
+    Since stroma has no distinct nuclei, we sample at a regular grid.
+
+    Parameters
+    ----------
+    st_mask : [H, W] bool mask at SMALL resolution
+    scale   : multiply coords by this to get ORIGINAL resolution coords
+    step    : grid spacing in small-resolution pixels
+
+    Returns
+    -------
+    list of dicts: [{x, y, cell_type='ST'}, ...]
+    """
+    ys, xs = np.where(st_mask)
+    if len(ys) == 0:
+        return []
+    # Subsample: take every N-th point from the set
+    # (using argmin over a grid is expensive; use modular skip instead)
+    idx = np.arange(0, len(ys), step)
+    coords = []
+    for i in idx:
+        coords.append({
+            "x":         int(xs[i] * scale),
+            "y":         int(ys[i] * scale),
+            "cell_type": "ST",
+        })
+    return coords
+
+
+def extract_cell_coordinates(
+    segmentation_result: dict,
+) -> dict[str, list[dict]]:
+    """
+    Extract pre-computed coordinates from a segmentation result dict.
+
+    Use this when you already have the result of segment_tissue() and
+    just want the coordinates in a clean format.
+
+    Returns
+    -------
+    dict with keys 'TC', 'LC', 'ST' each containing a list of
+    coordinate dicts: [{x, y, area_px (TC/LC only), cell_type}, ...]
+    """
+    return {
+        "TC": segmentation_result.get("tc_coords", []),
+        "LC": segmentation_result.get("lc_coords", []),
+        "ST": segmentation_result.get("st_coords", []),
     }
